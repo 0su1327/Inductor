@@ -169,8 +169,6 @@ class AutotuneCache:
             "found_by_coordesc": found_by_coordesc,
             "time_taken_ms": time_taken_ns // 1000000,  # Convert from NS to MS
         }
-        # youngus define
-        # print(data)
         if local_cache := self.local_cache:
             cache, key = local_cache
             cache.put(key, data)

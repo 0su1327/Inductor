@@ -3046,7 +3046,7 @@ class TritonKernel(SIMDKernel):
                 "coordinate_descent_check_all_directions"
             ] = config.coordinate_descent_check_all_directions
         return inductor_meta
-
+####################################################################
     #youngsu define
     #원래 welder에는 초기 base tile보다 작은 tile은 다 잘라낸다.
     #base tile을 1이라고 가정하고 전체 configuration을 다 가져온다고 하자.
@@ -3068,7 +3068,8 @@ class TritonKernel(SIMDKernel):
         factors.update(two_powers)
         final_factors = [s for s in sorted(list(factors)) if s <=numel]
         return final_factors
-    
+####################################################################  
+
     def codegen_kernel(self, name=None):
         code = IndentedBuffer()
 
@@ -3225,7 +3226,7 @@ class TritonKernel(SIMDKernel):
             code.writeline("")
             code.splice(helper)
 
-    
+  ##############################################################################  
         # 일단 2D에 대한 TENSOR SHAPE이 온다고 가정하여 XBLOCK, YBLOCK이 만들어진다고 가정하고 
         # XBLOCK, YBLOCK의 후보군을 자동으로 만들어서 configs로 넘겨주는 알고리즘을 여기에서 만들어야 함.
         # 여기에서 미리 xnumel, ynumel을 받을 수 있나?(Yes)
@@ -3276,6 +3277,7 @@ class TritonKernel(SIMDKernel):
                 )
                 @triton.jit
             """ 
+##############################################################################
         elif self.fixed_config:
             heuristics_line = f"""
                 @triton_heuristics.{self._get_heuristic()}(
@@ -3330,6 +3332,8 @@ class TritonKernel(SIMDKernel):
 
         return code.getvalue()
 
+    
+    
     
     @staticmethod
     def _get_persistent_RBLOCK(rnumel):

@@ -65,8 +65,6 @@ from .utils import (
 )
 from .virtualized import V
 
-from torch._inductor.runtime.triton_heuristics import CachingAutotuner
-
 
 log = logging.getLogger(__name__)
 fusion_log = torch._logging.getArtifactLogger(__name__, "fusion")
@@ -188,6 +186,7 @@ class BaseSchedulerNode:
     min_order: int
     max_order: int
     mpi_node: MemoryPlanningInfoForNode
+    tiling: Dict[str, sympy.Expr]
 
     def __init__(self, scheduler: Scheduler) -> None:
         self.scheduler: Scheduler = scheduler
@@ -1849,12 +1848,12 @@ class Scheduler:
         # mutation_renames = {"buf1" : "buf0"}
         # in codegen we only use buf0, never buf1
         self.mutation_renames: Dict[str, str] = {}
-
+        ########################################################################
+        # self.get_buffer_info()
+        ########################################################################
         self.compute_dependencies()
-        # self.nodes = self.topological_sort_schedule(self.nodes)
+        self.nodes = self.topological_sort_schedule(self.nodes)
         self.dead_node_elimination()
-
-        # V.debug.dce(self.nodes)
         self.name_to_fused_node = {n.get_name(): n for n in self.nodes}
         self.compute_ancestors()
         self.nodes = comms.decide_global_ordering_of_comms(
@@ -1893,7 +1892,9 @@ class Scheduler:
         V.debug.ir_post_fusion(self.nodes)
         V.debug.graph_diagram(self.nodes)
         self.debug_draw_graph()
-
+        ########################################################################
+        # self.get_buffer_info()
+        ########################################################################
         # used during codegen:
         self.buffer_names_to_free: OrderedSet[str] = OrderedSet()
 
@@ -1908,7 +1909,25 @@ class Scheduler:
                 "num_nodes_after_fusion": len(self.nodes),
             }
         )
-
+    ###############################################################
+    # def get_buffer_info(self):
+    #     for node in self.nodes:
+    #         if isinstance(node, (SchedulerNode, FusedSchedulerNode)): 
+    #         # and not isinstance(node.node, ir.MultiTemplateBuffer):
+    #             print(node.get_name())
+    #             # print(node.node.data)
+    #             # print(node.node.shape)
+    #             print(node)
+    #             print("reads : ", node.read_writes.reads)
+    #             print("writes : ", node.read_writes.writes)
+    #             print("\n")
+    #         else:
+    #             print(node.get_name(), end='\n')
+    #             print(node)
+    #     print("==================================================")
+    ###############################################################
+    
+    
     def get_donated_buffers(self) -> Dict[str, SchedulerDonatedBuffer]:
         name_to_donated_buf = {}
         for name in V.graph.graph_inputs_original:
@@ -2236,8 +2255,6 @@ class Scheduler:
                             u for u in users if u.node.get_name() != node.get_name()
                         ]
         self.nodes = list(reversed(updated_nodes))
-        
-        
 
         # Prune any WeakDeps no longer needed
         for node in self.nodes:
@@ -2336,10 +2353,8 @@ class Scheduler:
             node.max_order = order
 
     def merge_loops(self) -> None:
-        
         for node in self.nodes:
             if not config.loop_ordering_after_fusion:
-                
                 continue
 
             # Even for CPU, if we are using the halide backend, we still need
@@ -2370,14 +2385,10 @@ class Scheduler:
                 # FusedSchedulerNode having different merged loops.
                 # Skip CPU backend for now.
 
-
     def fuse_nodes(self, nodes: List[BaseSchedulerNode]) -> List[BaseSchedulerNode]:
         """
         Combine eligible nodes into FusedSchedulerNodes.
         """
-        
-        
-        
         with dynamo_timed("Scheduler.fused_nodes"):
             for i in range(10):
                 old_len = len(nodes)
@@ -2387,7 +2398,6 @@ class Scheduler:
                     old_len,
                 )
                 nodes = self.fuse_nodes_once(nodes)
-               
                 new_len = len(nodes)
                 fusion_log.debug(
                     "completed fusion round (%d/10): fused %d nodes into %d nodes\n",
@@ -2400,7 +2410,6 @@ class Scheduler:
                         "===== fusion complete (%d iterations) =====", i + 1
                     )
                     break
-            
             return nodes
 
     def process_grouped_nodes(self) -> None:
@@ -2583,6 +2592,7 @@ class Scheduler:
         ):
             multi_node = node1.node
             choice_timings = multi_node.choice_timings
+
             _, ms1 = multi_node.get_min_choice()
             ms2, path2 = self.benchmark_fused_nodes(node_list_2)
 
@@ -2625,121 +2635,24 @@ class Scheduler:
         else:
             try:
                 ms1, path1 = self.benchmark_fused_nodes(node_list_1)
-                #youngsu define
-                #triton_heuristics.py에서 실제 benchmark 후에 저장하는 best config를 launcher에 저장해서 V로 접근하여 가져옴.(CachingAutotune)
-                # _, (numel1, rnumel1) = node1.group
-                # config_for_node_list1 = V.config
-                # if config_for_node_list1:
-                #     print(node_list_1)
-                #     print("config of node_list1: XBLOCK => ", config_for_node_list1[0].config.kwargs['XBLOCK'])
-                #     if 'YBLOCK' in config_for_node_list1[0].config.kwargs:
-                #         print("config of node_list2: YBLOCK => ",config_for_node_list1[0].config.kwargs['YBLOCK'])
-                #     # RBLOCK은 어차피 group의 r과 맞춰지기 때문에 따로 가져올 필요 x
-                #     # if 'RBLOCK' in config_for_node_list1[0].config.kwargs:
-                #     #     print("config of node_list2: RBLOCK => ",config_for_node_list1[0].config.kwargs['RBLOCK'])
-                #     if rnumel1!=1:
-                #         rnumel1 = 2 ** math.ceil(math.log2(rnumel1))
-                #         print("config of node_list1 : RBLOCK ", rnumel1)
-                #     print("config of node_list1: num_stages => ", config_for_node_list1[0].config.num_stages)
-                #     print("config of node_list1: num_warps => ", config_for_node_list1[0].config.num_warps)
-                #     print("==============================================================================")
-                
-                # numel_info1 = V.tiling1
-                # print(numel_info1)
-                
-                # 만약 elementwise 간의 연산이 아니라면 그냥 numel 가져오면 되고
-                # 아니라면 numel, rnumel, ynumel이 나뉘어진 결과를 가져와야 한다.
-                # with V.set_tiling_info():
-                #     print(V.tiling)
-                # tiling1 = V.tiling.select_tiling(node1.get_nodes(), numel1, rnumel1)
-               
-                # 여기에서 ms1이 infinite라고 판단하고 false를 return해버린다.
                 if math.isinf(ms1):
                     why("register spilling of the first kernel")
                     return False
-                
                 ms2, path2 = self.benchmark_fused_nodes(node_list_2)
-                # youngsu define
-                # _, (numel2, rnumel2) = node2.group
-                # config_for_node_list2 = V.config
-                # if config_for_node_list2:
-                #     print(node_list_2)
-                #     print("config of node_list2: XBLOCK => ",config_for_node_list2[0].config.kwargs['XBLOCK'])
-                #     if 'YBLOCK' in config_for_node_list2[0].config.kwargs:
-                #         print("config of node_list2: YBLOCK => ",config_for_node_list2[0].config.kwargs['YBLOCK'])
-                #     if rnumel2!=1:
-                #         rnumel2 = 2 ** math.ceil(math.log2(rnumel2))
-                #         print("config of node_list2 : RBLOCK ", rnumel2)
-                #     print("config of node_list2: num_stages => ", config_for_node_list2[0].config.num_stages)
-                #     print("config of node_list2: num_warps => ", config_for_node_list2[0].config.num_warps)
-                #     print("==============================================================================")
-                
-                # #x, r 형태로 select tiling 결과를 받아온다.
-                # numel_info2 = V.tiling2
-                # print(numel_info2)
-
                 if math.isinf(ms2):
                     why("register spilling of the second kernel")
                     return False
-                
-                # just compare the grid size
-                # 구분해서 fusion해야할 것 같다. 모든 op가 아니라 reduction이 있는 group을 찾아내야 한다.(scheduler nodes의 data 부분을 확인하면 되지 않을까?)
-                # 왜냐하면 self.group에서 reduction 연산이 group을 대표하도록 만들었기 때문이다. self.group을 확인해서 만약 reduction이라면 그 다음 연산자와 합쳐보려는 거다.
-                # 근데 아직도 fusion condition을 어떻게 세워야 하는지 모르겠다.
-                # 해당 그룹에 대해서만 뒤의 operator와 fusion하는 것으로 보인다.
-                # 나머지는 그대로 따라가지만 reduction연산의 fusion만 관연하는 걸로 생각해보자.
-                # 그러면 기존의 operator fusion은 그대로 따라가고 그 중에서 reduction연산만 골라서 따로 구분해야 할 듯?
-                # node_list_1, node_list_2 순회하면서 각 index에 node의 data가 reduction인지 확인해서 reduction인 node만 다음 연산자와 fusion하게 한다.
-                
-                #self.group에서 rnumel이 존재하고 rnumel!=1이라면 stitch scheme를 사용가능
-                
-                
-                # if(config_for_node_list1[0].config.kwargs['XBLOCK'] == config_for_node_list2[0].config.kwargs['XBLOCK']):
-                #     print("It can be fused by astitch fusion condition(just compare XBLOCK)")
-                # 여기에서 넘길 때, node_list_fused에 미리 저장해놓는 형식으로?
-                # 
-                
-                # print("This is about fusion groups for AStitch")
-                
-                # if(numel_info1['x']/config_for_node_list1[0].config.kwargs['XBLOCK'] == 
-                #    numel_info2['x']/config_for_node_list2[0].config.kwargs['XBLOCK']):
-                #     print(f"It can fused by AStitch fusion condition!:{config_for_node_list1}, {config_for_node_list2}")
-                #     print("==============================================================================")
-                # else:
-                #     print("It cannot fused by AStitch fusion condition!")
-                #     print("==============================================================================")
-                
-                
-                ms_fused, path_fused = self.benchmark_fused_nodes(node_list_fused)           
-                
-                # config_for_node_list3 = V.config
-
-                # if config_for_node_list3:
-                #     print(node_list_fused)
-                #     print("config of node_list1: XBLOCK => ",config_for_node_list3[0].config.kwargs['XBLOCK'])
-                #     if 'YBLOCK' in config_for_node_list3[0].config.kwargs:
-                #         print("config of node_list2: YBLOCK => ",config_for_node_list3[0].config.kwargs['YBLOCK'])
-                #     if rnumel1!=1:
-                #         print("config of node_list1 : RBLOCK ", rnumel1)
-                #     if rnumel2!=1:
-                #         print("config of node_list2 : RBLOCK ", rnumel2)
-                    
-                #     print("config of node_list1: num_stages => ", config_for_node_list3[0].config.num_stages)
-                #     print("config of node_list1: num_warps => ", config_for_node_list3[0].config.num_warps)
-                #     print("==============================================================================")
-                
+                ms_fused, path_fused = self.benchmark_fused_nodes(node_list_fused)
                 if math.isinf(ms_fused):
                     why("register spilling of the fused kernel")
                     return False
-                
-                
             except CompilationError as e:
                 # workaround triton issue: https://github.com/openai/triton/issues/2151
                 if "Loop-carried variable" in str(e):
                     return True  # allow fusion
                 else:
                     raise
-        # print("fininshed speedup_by_fusion--------------------------------------------")            
+
         log_fusion(ms_fused, ms1, ms2)
         if (
             is_metric_table_enabled("slow_fusion")
@@ -2779,8 +2692,8 @@ class Scheduler:
             node1 = self.name_to_fused_node[node1.get_first_name()]
             node2 = self.name_to_fused_node[node2.get_first_name()]
             if self.can_fuse(node1, node2) and not self.will_fusion_create_cycle(
-                node1, node2):
-                
+                node1, node2
+            ):
                 if not self.speedup_by_fusion(node1, node2):
                     continue
                 fusion_log.debug(
@@ -2869,7 +2782,7 @@ class Scheduler:
                     if key in seen:
                         continue
                     seen.add(key)
-                    
+
                     if self.can_fuse(node1, node2):
                         possible_fusions.append(key)
                     elif (node2.is_template() or node2.is_foreach()) and self.can_fuse(
@@ -2877,7 +2790,6 @@ class Scheduler:
                     ):
                         # foreach fusions and epilogue fusions are order dependent
                         possible_fusions.append((node2, node1))
-                    
 
         buffer_names_grouping = collections.defaultdict(list)
         for node in nodes:
@@ -2900,7 +2812,7 @@ class Scheduler:
         possible_fusions = self.get_possible_fusions_with_highest_priority(
             possible_fusions
         )
-        # possible_fusions.sort(key=self.score_fusion_key, reverse=True)
+        possible_fusions.sort(key=self.score_fusion_key, reverse=True)
         fusion_log.debug("found %d possible fusions", len(possible_fusions))
         return possible_fusions
 
@@ -3179,7 +3091,10 @@ class Scheduler:
         Determine if it is possible to combine node1 and node2 into a
         single fused node.
         """
-
+        
+        if config.disable_can_fuse :
+            return True
+        
         if node1 is node2:
             return False
 
@@ -3244,7 +3159,7 @@ class Scheduler:
             )
 
         if not V.choices.can_fuse(self, node1, node2, shared_data_score):
-            return True
+            return False
 
         if node1.get_operation_names() & node2.ancestors:
             # node2 depends on node1 outputs
@@ -3458,15 +3373,12 @@ class Scheduler:
                     (node1, node2)
                 )
         # return the possible fusions with highest priority
-        # youngsu define : remove priority
-        # possible_fusions_with_highest_priority = min(
-        #     possible_fusions_group_by_priority.items(), key=operator.itemgetter(0)
-        # )[1]
-        # assert len(possible_fusions_with_highest_priority) > 0
-        # return possible_fusions_with_highest_priority
-        
-        return possible_fusions
-        
+        possible_fusions_with_highest_priority = min(
+            possible_fusions_group_by_priority.items(), key=operator.itemgetter(0)
+        )[1]
+        assert len(possible_fusions_with_highest_priority) > 0
+        return possible_fusions_with_highest_priority
+
     def score_fusion_key(
         self, nodes: Tuple[BaseSchedulerNode, BaseSchedulerNode]
     ) -> Any:

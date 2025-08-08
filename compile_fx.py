@@ -542,8 +542,6 @@ def compile_fx_inner(
     kwargs.setdefault("layout_opt", None)
     kwargs.setdefault("extern_node_serializer", None)
 
-    #youngsu define
-    # print("compile_fx_inner", gm)
     
     # Need with_fresh_cache_if_config for compile_fx_inner even if we already have one for
     # compile_fx. The reason is the compilation for backward graph may happen after
@@ -722,8 +720,6 @@ def _compile_fx_inner(
         # CACHE HIT: not much to really do, just make sure the cache key
         # is recorded on the graph
         else:
-            #youngsu define
-            print("CACHE HIT===========================================")
             assert cache_info["cache_state"] == "hit"
             assert mb_compiled_graph is not None
             assert key_info is not None

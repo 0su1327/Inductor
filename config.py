@@ -28,7 +28,7 @@ def bundle_triton_into_fx_graph_cache_default() -> Optional[bool]:
 
 use_user_codegen = False
 
-disable_can_fuse = True
+disable_can_fuse = False
 
 # Enable auto_functionalized_v2 (enabled by default)
 enable_auto_functionalized_v2 = (
