@@ -1849,7 +1849,7 @@ class Scheduler:
         # in codegen we only use buf0, never buf1
         self.mutation_renames: Dict[str, str] = {}
         ########################################################################
-        # self.get_buffer_info()
+        self.get_buffer_info()
         ########################################################################
         self.compute_dependencies()
         self.nodes = self.topological_sort_schedule(self.nodes)
@@ -1893,7 +1893,7 @@ class Scheduler:
         V.debug.graph_diagram(self.nodes)
         self.debug_draw_graph()
         ########################################################################
-        # self.get_buffer_info()
+        self.get_buffer_info()
         ########################################################################
         # used during codegen:
         self.buffer_names_to_free: OrderedSet[str] = OrderedSet()
@@ -1910,21 +1910,21 @@ class Scheduler:
             }
         )
     ###############################################################
-    # def get_buffer_info(self):
-    #     for node in self.nodes:
-    #         if isinstance(node, (SchedulerNode, FusedSchedulerNode)): 
-    #         # and not isinstance(node.node, ir.MultiTemplateBuffer):
-    #             print(node.get_name())
-    #             # print(node.node.data)
-    #             # print(node.node.shape)
-    #             print(node)
-    #             print("reads : ", node.read_writes.reads)
-    #             print("writes : ", node.read_writes.writes)
-    #             print("\n")
-    #         else:
-    #             print(node.get_name(), end='\n')
-    #             print(node)
-    #     print("==================================================")
+    def get_buffer_info(self):
+        for node in self.nodes:
+            if isinstance(node, (SchedulerNode, FusedSchedulerNode)): 
+            # and not isinstance(node.node, ir.MultiTemplateBuffer):
+                print(node.get_name())
+                # print(node.node.data)
+                # print(node.node.shape)
+                print(node)
+                print("reads : ", node.read_writes.reads)
+                print("writes : ", node.read_writes.writes)
+                print("\n")
+            else:
+                print(node.get_name(), end='\n')
+                print(node)
+        print("==================================================")
     ###############################################################
     
     
