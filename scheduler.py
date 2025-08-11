@@ -64,7 +64,7 @@ from .utils import (
     sympy_product,
 )
 from .virtualized import V
-
+from itertools import product
 
 log = logging.getLogger(__name__)
 fusion_log = torch._logging.getArtifactLogger(__name__, "fusion")
@@ -1850,6 +1850,7 @@ class Scheduler:
         self.mutation_renames: Dict[str, str] = {}
         ########################################################################
         self.get_buffer_info()
+        self.get_input_output_tile()
         ########################################################################
         self.compute_dependencies()
         self.nodes = self.topological_sort_schedule(self.nodes)
@@ -1893,7 +1894,7 @@ class Scheduler:
         V.debug.graph_diagram(self.nodes)
         self.debug_draw_graph()
         ########################################################################
-        self.get_buffer_info()
+        # self.get_buffer_info()
         ########################################################################
         # used during codegen:
         self.buffer_names_to_free: OrderedSet[str] = OrderedSet()
@@ -1915,17 +1916,113 @@ class Scheduler:
             if isinstance(node, (SchedulerNode, FusedSchedulerNode)): 
             # and not isinstance(node.node, ir.MultiTemplateBuffer):
                 print(node.get_name())
-                # print(node.node.data)
-                # print(node.node.shape)
-                print(node)
+                if not isinstance(node.node, ir.MultiTemplateBuffer):
+                    print(node.node.data)
+                    print(node.node.layout)
                 print("reads : ", node.read_writes.reads)
                 print("writes : ", node.read_writes.writes)
                 print("\n")
             else:
                 print(node.get_name(), end='\n')
                 print(node)
-        print("==================================================")
-    ###############################################################
+                # print(node.node)
+                # print("reads : ", node.read_writes.reads)
+                # print("writes : ", node.read_writes.writes)
+                # print("\n")
+        print("==================================================================================")
+        
+        
+    #use tile_map to mapping output tile and input tile    
+    def get_input_output_tile(self):
+        tile_map = []
+        for node in self.nodes:
+            if isinstance(node, (SchedulerNode, FusedSchedulerNode)):
+                tile_map = self.build_op_entry(node.node.layout, node.read_writes.reads, node.node.data['reduction_ranges'])
+    
+        return tile_map
+    
+    #to generate all candidate sizes of each axis
+    def candidate_sizes_for_axis(self, n):
+        if n == 1 : return [1]
+        factors = []
+        sqrt_n = int(n**0.5)
+        
+        for i in range(1, sqrt_n+1):
+            if n % i ==0:
+                factors.append(i)
+                if i*i !=n:
+                    factors.append(n // i)
+        
+        #add exponential of 2(2 ~ 32)
+        factors = set(factors)
+        two_powers = [2, 4, 8, 16, 32]
+        factors.update(two_powers)
+        final_factors = [s for s in sorted(list(factors)) if s <=n]
+        return final_factors
+    
+    #generate all output tile config
+    def gen_output_tile_config(self, output_tile, max_total=200):
+        per_axis_candidate =[]
+        i = 0
+        for output in output_tile:
+            cands = self.candidate_sizes_for_axis(output)
+            per_axis_candidate.append((i, cands))
+            i+=1
+        tiles = []
+        # 각 후보군을 모두 조합한 결과를 tiles에 저장 후 반환
+        for sizes in product(*[c for _, c in per_axis_candidate]):
+            tiles.append(list(sizes))
+        #만약 조합이 너무 많다면 max_total만큼만 수행하고 2의 지수승을 먼저 후보군에서 sort()하는 방식 사용가능
+        return tiles
+    
+    def required_input_tile_for_read(self, output_tile, read_deps, reduction):
+        
+        input_tile = {}
+        output_tile = list(output_tile)
+        for axis in output_tile:
+            # pointwise/broadcast 처리
+            # read dependencies와 output tile size를 비교해서 곱했을 때 같은 값이 아닌 buffer는 broadcast되었기 때문에 broadcast되지 않은 축을 제외하고는 모두 1로 만든다.
+            # 만약, [4096, 4096]이런식으로 나오게 되면 어떤게 broadcast축인지 알기 어렵기 때문에 명확하게 하려면 parsing을 해서 data 내부의 inner_fn을 확인해서 어떤 index가 broadcast, reduction 축인지 알 수 있다.
+            # 단, reduction은 따로 처리하기 위해 reduction이 None일 때를 조건으로 한다.
+            if axis in read_deps and reduction is not None:
+                input_tile[axis] = output_tile[axis]
+            else:
+                input_tile[axis] = 1
+        
+        #reduction 처리
+        if axis in read_deps:
+            candidate=None
+            #output tile을 reverse로 순회하면서 1이 있으면 해당 index를 reduction 축으로 한다.(좀 더 명확하게 하려면 parsing을 해야할 것 같은데)
+            for axis in reversed(output_tile):
+                if input_tile.get(axis, 1) == 1 and axis not in read_deps:
+                    candidate = axis
+                    break
+            
+            if candidate is not None:
+                input_tile[candidate] = reduction
+            else:
+                print("error!")
+        
+        return input_tile
+    
+    
+    # output_axes : node.node.layout의 size를 통해 얻을 수 있음
+    # read_deps_map : node.read_writes.reads를 통해 얻을 수 있음
+    # reduction_axes : node.node.data의 reduction_ranges를 통해 알 수 있음
+    def build_op_entry(self, output_size, read_deps_map, reduction_axes):
+        op_entries = []
+        # generate output tile configs
+        out_tiles = self.gen_output_tile_config(output_size)
+        for t_out in out_tiles:
+            inputs = {}
+            # generate input tile configs from read dependencies
+            for buf, deps in read_deps_map.items():
+                inputs[buf] = self.required_input_tile_for_read(t_out, deps, reduction_axes)
+            op_entries.append({'output_tile': t_out, 'input_tile':inputs})
+        return op_entries
+                
+            
+    #############################################################################
     
     
     def get_donated_buffers(self) -> Dict[str, SchedulerDonatedBuffer]:
