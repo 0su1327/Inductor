@@ -1937,8 +1937,10 @@ class Scheduler:
         tile_map = []
         for node in self.nodes:
             if isinstance(node, (SchedulerNode, FusedSchedulerNode)):
-                tile_map = self.build_op_entry(node.node.layout, node.read_writes.reads, node.node.data['reduction_ranges'])
-    
+                is_reduction = node.is_reduction()
+                tile_map = self.build_op_entry(node.node.layout, node.read_writes.reads, node.read_writes.writes, node.node.data.reduction_ranges[0], is_reduction)
+        
+        print(tile_map)
         return tile_map
     
     #to generate all candidate sizes of each axis
@@ -1961,10 +1963,11 @@ class Scheduler:
         return final_factors
     
     #generate all output tile config
-    def gen_output_tile_config(self, output_tile, max_total=200):
+    def gen_output_tile_config(self, output_layout, max_total=200):
         per_axis_candidate =[]
         i = 0
-        for output in output_tile:
+        # output tile하나씩 순회하면서 각각의 후보군 정함
+        for output in output_layout:
             cands = self.candidate_sizes_for_axis(output)
             per_axis_candidate.append((i, cands))
             i+=1
@@ -1975,49 +1978,89 @@ class Scheduler:
         #만약 조합이 너무 많다면 max_total만큼만 수행하고 2의 지수승을 먼저 후보군에서 sort()하는 방식 사용가능
         return tiles
     
-    def required_input_tile_for_read(self, output_tile, read_deps, reduction):
+    #여기에서 말하는 output_tile은 여러 tile configuration 중에서 하나인 것임
+    def propagate_input_tile(self, output_tile, read_deps, write_deps, reduction, is_reduction):
         
         input_tile = {}
         output_tile = list(output_tile)
-        for axis in output_tile:
-            # pointwise/broadcast 처리
-            # read dependencies와 output tile size를 비교해서 곱했을 때 같은 값이 아닌 buffer는 broadcast되었기 때문에 broadcast되지 않은 축을 제외하고는 모두 1로 만든다.
-            # 만약, [4096, 4096]이런식으로 나오게 되면 어떤게 broadcast축인지 알기 어렵기 때문에 명확하게 하려면 parsing을 해서 data 내부의 inner_fn을 확인해서 어떤 index가 broadcast, reduction 축인지 알 수 있다.
-            # 단, reduction은 따로 처리하기 위해 reduction이 None일 때를 조건으로 한다.
-            if axis in read_deps and reduction is not None:
-                input_tile[axis] = output_tile[axis]
-            else:
-                input_tile[axis] = 1
+        for write in write_deps.__getstate__():
+            #write buffer의 각 dimension size 곱
+            write_size = math.prod(write.ranges.values())
         
+        # pointwise/broadcast 처리
+        if not is_reduction : 
+            for output_tile_config in output_tile:
+                # 만약, [4096, 4096]이런식으로 나오게 되면 어떤게 broadcast축인지 알기 어렵기 때문에 명확하게 하려면 parsing을 해서 data 내부의 inner_fn을 확인해서 어떤 index가 broadcast, reduction 축인지 알 수 있다.
+                # 단, reduction은 따로 처리하기 위해 reduction이 None일 때를 조건으로 한다.
+                # 만약 read, write dependencies의 각 dimension size를 곱했을 때 같으면 pointwise 연산
+                
+                # node.read_writes.reads.__getstate__()[]로 index, range, sizes 모두 접근 가능
+                # dependencies하나씩 순회하면서 size 확인
+                read_size = 0
+                for read in read_deps.__getstate__():
+                    #read buffer의 각 dimension size 곱
+                    read_size = math.prod(read.ranges.values())
+                    #pointwise 연산인 경우 size가 같다.
+                    #이런 경우에는 output_tile과 tile이 같다.
+                    if read_size == write_size :
+                        input_tile[read.name] = output_tile_config
+                        
+                    #broadcast 연산인 경우 size가 다르다.
+                    #layout을 순회하면서 size의 값을 broadcast축이 아닌 것으로 나눈 값이랑 같은 것을 1로 바꾼다.
+                    #즉, layout의 dimension을 하나하나 순회하면서 나눈 값과 같은 것만 1로 바꾼다.
+                    else :
+                        broadcast_tile = []
+                        for i in output_tile_config:
+                            if i == write_size/read_size:
+                                broadcast_tile.append(1)
+                            else:
+                                broadcast_tile.append(i)
+                        input_tile[read.name] = broadcast_tile
+                
         #reduction 처리
-        if axis in read_deps:
-            candidate=None
-            #output tile을 reverse로 순회하면서 1이 있으면 해당 index를 reduction 축으로 한다.(좀 더 명확하게 하려면 parsing을 해야할 것 같은데)
-            for axis in reversed(output_tile):
-                if input_tile.get(axis, 1) == 1 and axis not in read_deps:
-                    candidate = axis
-                    break
-            
-            if candidate is not None:
-                input_tile[candidate] = reduction
-            else:
-                print("error!")
-        
+        else:
+            #위와 비슷하게 size가 같으면 그냥 pointwise로 생각하고
+            #size가 다르면 reduction으로 분류한다.
+            for output_tile_config in output_tile:
+                for read in read_deps.__getstate__():
+                    #read buffer의 각 dimension size 곱
+                    read_size = math.prod(read.ranges.values())
+                    #pointwise 연산인 경우 size가 같다.
+                    #이런 경우에는 output_tile과 tile이 같다.
+                    if read_size == write_size :
+                        input_tile[read.name] = output_tile_config
+
+                    else :
+                        reduction_tile = []
+                        # 어떤 축이 reduction 축인지 확인할 수 있는 방법?? 일단은 pattern은 output shape에서 1을 가지는 index 중에 가장 큰 index가 reduction 축이 된다.
+                        for i in reversed(output_tile_config):
+                            mark = False
+                            if i == 1 and not mark:
+                                reduction_tile.append(reduction)
+                                mark = True
+                            else:
+                                #reduction 축 외에는 output tile shape과 그대로 가져간다.
+                                reduction_tile.append(i)
+                        
+                        input_tile[read.name] = reduction_tile
         return input_tile
     
     
     # output_axes : node.node.layout의 size를 통해 얻을 수 있음
     # read_deps_map : node.read_writes.reads를 통해 얻을 수 있음
     # reduction_axes : node.node.data의 reduction_ranges를 통해 알 수 있음
-    def build_op_entry(self, output_size, read_deps_map, reduction_axes):
+    def build_op_entry(self, output_layout, read_deps, write_deps, reduction_ranges, is_reduction):
         op_entries = []
         # generate output tile configs
-        out_tiles = self.gen_output_tile_config(output_size)
+        out_tiles = self.gen_output_tile_config(output_layout.size)
+        # 각 output tiles에 대해서 input tile configuration을 고르게 된다.
+        # reduction은 reduction축에 대해서만 모두 참조하고 나머지는 output tile에 맞춰서 tile이 정해진다.
+        # broadcast는 broadcast축에 대해서만 참조가 바뀌고 나머지는 1로 고정된다.
         for t_out in out_tiles:
             inputs = {}
             # generate input tile configs from read dependencies
-            for buf, deps in read_deps_map.items():
-                inputs[buf] = self.required_input_tile_for_read(t_out, deps, reduction_axes)
+            #inputs는 dictionary형태로 buffer이름과 input tile을 저장하는게 목표
+            inputs = self.propagate_input_tile(t_out, read_deps, write_deps, reduction_ranges, is_reduction)
             op_entries.append({'output_tile': t_out, 'input_tile':inputs})
         return op_entries
                 
