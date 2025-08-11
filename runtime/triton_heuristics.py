@@ -914,9 +914,6 @@ class CachingAutotuner(KernelInterface):
         timings = self.benchmark_all_configs(*args, **kwargs)
         benchmark_time_taken_ns = time.time_ns() - start_time
         self.launchers = [builtins.min(timings, key=timings.get)]
-        #youngsu define
-        # print("This is autotune_to_one_config")
-        # V.set_config_info(self.launchers[0].config)
         
         self.autotune_time_taken_ns = (
             self.precompile_time_taken_ns + benchmark_time_taken_ns
@@ -1011,10 +1008,6 @@ class CachingAutotuner(KernelInterface):
         best_config = self.coordesc_tuner.autotune(
             benchmark_one_config, launcher.config, None
         )
-        #youngsu define
-        # print("This is for best_config in coordinate_descent_tuning========================================")
-        # print("best_config result in coordinate_descent_tuning : ",best_config)
-        # V.set_config_info(best_config)
         
         
         coordesc_time_taken_ns = time.time_ns() - start_time
@@ -1056,9 +1049,6 @@ class CachingAutotuner(KernelInterface):
             ]
 
         #youngsu define
-        # 여기에서는 XBLOCK, YBLOCK을 확인하지 않는듯?
-        # print("This is for launcher config(maybe best) to compare best_config==================== ")
-        # print("best_config result in run method : ",self.launchers[0].config)
         V.set_config_info(self.launchers)
         
         
@@ -1310,7 +1300,6 @@ def cached_autotune(
         # Context: When TritonKernel.no_x_dim is True, we hardcode XBLOCK to 1.
         import inspect
 
-        #youngsu define (why???)
         if "XBLOCK" not in inspect.signature(fn.fn).parameters:
             for tconfig in configs:
                 if "XBLOCK" in tconfig.kwargs:

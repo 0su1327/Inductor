@@ -374,9 +374,6 @@ class SIMDKernel(Kernel):
         )
         self.no_x_dim = self.want_no_x_dim()
         self.code_hash: Optional[str] = None
-        
-        self.tiling = None
-        
 
         # define this in a closure to make cache local to object
         @functools.lru_cache(None)
@@ -1019,10 +1016,10 @@ class SIMDScheduling(BaseScheduling):
         why = WhyNoFuse(node1, node2)
         
         #youngsu define
-        self.numel_info1 = self.select_tiling(node1.get_nodes(), numel1, rnumel1)
-        V.set_tiling_info1(self.numel_info1)
-        self.numel_info2 = self.select_tiling(node2.get_nodes(), numel2, rnumel2)
-        V.set_tiling_info2(self.numel_info2)
+        # self.numel_info1 = self.select_tiling(node1.get_nodes(), numel1, rnumel1)
+        # # V.set_tiling_info1(self.numel_info1)
+        # self.numel_info2 = self.select_tiling(node2.get_nodes(), numel2, rnumel2)
+        # V.set_tiling_info2(self.numel_info2)
 
         if node1.is_split_scan() and not node2.is_split_scan():
             if node2.is_reduction():
@@ -1129,21 +1126,6 @@ class SIMDScheduling(BaseScheduling):
 
     can_fuse_vertical = can_fuse
     can_fuse_horizontal = can_fuse
-
-    # #welder get_all_factors(argument : each dimension size)
-    # def get_all_factors(n : int) -> List[int]:
-    #     n0 = int(np.ceil(np.sqrt(n)))
-    #     val = np.where(n % np.arange(1, n0) == 0)[0] + 1
-    #     mid = np.array([], dtype=int) if n0 * n0 != n else [n0]
-    #     return [int(x) for x in np.concatenate([val, mid, n // val[::-1]])]
-    
-    # def all_tile_configurations(self) -> Iterable[]:
-    #     #각 차원의 numel을 가지고 오면 된다.(xnumel, ynumel)
-    #     _steps = [get_all_factors(n) for n in self.*.xnumel, ynumel]
-    #     #init tile : 1로 output dimension만큼 채워진 리스트
-    #     steps = [step[step.index(t):] for step, t in zip(_steps, init_tile)]
-    #     #그리고 추가적으로 2의 배수에 대해서도 steps에 추가해준다.
-        
     
     def generate_node_schedule(self, nodes, numel, rnumel):
         node_schedule: List[Any] = []
@@ -1719,7 +1701,6 @@ class SIMDScheduling(BaseScheduling):
     def generate_kernel_code_from_nodes(self, nodes, benchmark_kernel=False):
         if not nodes[0].is_template():
             _, (numel, rnumel) = max(nodes, key=lambda x: int(x.is_reduction())).group
-            # 결국 node_schedule에 하나의 node 정보만 들어가니까 여기에서 tile_map을 만들어서 넘겨줘야 하나?
             node_schedule = self.generate_node_schedule(nodes, numel, rnumel)
             tiling = self.select_tiling(node_schedule, numel, rnumel)
             kernel = self.kernel_type(
