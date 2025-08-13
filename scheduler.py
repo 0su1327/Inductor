@@ -30,7 +30,10 @@ from typing import (
     Union,
 )
 
+
 import sympy
+import pprint
+import re
 
 import torch
 import torch._inductor.async_compile  # noqa: F401 required to warm up AsyncCompile pools
@@ -1850,7 +1853,8 @@ class Scheduler:
         self.mutation_renames: Dict[str, str] = {}
         ########################################################################
         self.get_buffer_info()
-        self.get_input_output_tile()
+        # tile_map = self.get_input_output_tile()
+        # self.group_by_node(tile_map)
         ########################################################################
         self.compute_dependencies()
         self.nodes = self.topological_sort_schedule(self.nodes)
@@ -1936,11 +1940,18 @@ class Scheduler:
     def get_input_output_tile(self):
         tile_map = []
         for node in self.nodes:
-            if isinstance(node, (SchedulerNode, FusedSchedulerNode)):
+            #일단 mm연산에 대해서는 skip(MultiTemplateBuffer)
+            if isinstance(node, (SchedulerNode, FusedSchedulerNode)) and not isinstance(node.node, ir.MultiTemplateBuffer):
+                
                 is_reduction = node.is_reduction()
-                tile_map = self.build_op_entry(node.node.layout, node.read_writes.reads, node.read_writes.writes, node.node.data.reduction_ranges[0], is_reduction)
-        
-        print(tile_map)
+                if is_reduction:
+                    tile_map.append(self.build_op_entry(node.get_name(), node.node.layout, node.read_writes.reads, node.read_writes.writes, node.node.data.reduction_ranges[0], is_reduction, node.node.data.__inner_fn_str_cache))
+                    
+                else:
+                    tile_map.append(self.build_op_entry(node.get_name(), node.node.layout, node.read_writes.reads, node.read_writes.writes, None, is_reduction))
+                    
+        # print(tile_map)
+        # print("end of input_output_tile map=================================================================================")
         return tile_map
     
     #to generate all candidate sizes of each axis
@@ -1963,10 +1974,10 @@ class Scheduler:
         return final_factors
     
     #generate all output tile config
-    def gen_output_tile_config(self, output_layout, max_total=200):
+    def gen_output_tile_config(self, output_layout, write_deps):
         per_axis_candidate =[]
         i = 0
-        # output tile하나씩 순회하면서 각각의 후보군 정함
+        # output tile dimension을 하나씩 순회하면서 각각의 후보군 정함
         for output in output_layout:
             cands = self.candidate_sizes_for_axis(output)
             per_axis_candidate.append((i, cands))
@@ -1974,44 +1985,67 @@ class Scheduler:
         tiles = []
         # 각 후보군을 모두 조합한 결과를 tiles에 저장 후 반환
         for sizes in product(*[c for _, c in per_axis_candidate]):
-            tiles.append(list(sizes))
-        #만약 조합이 너무 많다면 max_total만큼만 수행하고 2의 지수승을 먼저 후보군에서 sort()하는 방식 사용가능
+            tiles.append({'output_tile': write_deps.__getstate__()[0].name, 'candidates' : list(sizes)})
         return tiles
     
     #여기에서 말하는 output_tile은 여러 tile configuration 중에서 하나인 것임
-    def propagate_input_tile(self, output_tile, read_deps, write_deps, reduction, is_reduction):
+    def propagate_input_tile(self, output_tile, read_deps, write_deps, reduction, is_reduction, output_layout, inner_fn):
         
         input_tile = {}
-        output_tile = list(output_tile)
-        for write in write_deps.__getstate__():
-            #write buffer의 각 dimension size 곱
-            write_size = math.prod(write.ranges.values())
-        
+        # output_tile = list(output_tile)
+        # for write in write_deps.__getstate__():
+        #write buffer의 각 dimension size 곱(write buffer는 1개임.)
+        write_size = math.prod(write_deps.__getstate__()[0].ranges.values())
+        # mm은 나중에 처리
         # pointwise/broadcast 처리
-        if not is_reduction : 
-            for output_tile_config in output_tile:
-                # 만약, [4096, 4096]이런식으로 나오게 되면 어떤게 broadcast축인지 알기 어렵기 때문에 명확하게 하려면 parsing을 해서 data 내부의 inner_fn을 확인해서 어떤 index가 broadcast, reduction 축인지 알 수 있다.
-                # 단, reduction은 따로 처리하기 위해 reduction이 None일 때를 조건으로 한다.
-                # 만약 read, write dependencies의 각 dimension size를 곱했을 때 같으면 pointwise 연산
-                
-                # node.read_writes.reads.__getstate__()[]로 index, range, sizes 모두 접근 가능
-                # dependencies하나씩 순회하면서 size 확인
-                read_size = 0
-                for read in read_deps.__getstate__():
-                    #read buffer의 각 dimension size 곱
-                    read_size = math.prod(read.ranges.values())
-                    #pointwise 연산인 경우 size가 같다.
-                    #이런 경우에는 output_tile과 tile이 같다.
-                    if read_size == write_size :
-                        input_tile[read.name] = output_tile_config
+        if not is_reduction :
+            # for output_tile_config in output_tile:
+            # 만약, [4096, 4096]이런식으로 나오게 되면 어떤게 broadcast축인지 알기 어렵기 때문에 명확하게 하려면 parsing을 해서 data 내부의 inner_fn을 확인해서 어떤 index가 broadcast, reduction 축인지 알 수 있다.
+            # 단, reduction은 따로 처리하기 위해 reduction이 None일 때를 조건으로 한다.
+            # 만약 read, write dependencies의 각 dimension size를 곱했을 때 같으면 pointwise 연산
+            # node.read_writes.reads.__getstate__()[]로 index, range, sizes 모두 접근 가능
+            # dependencies하나씩 순회하면서 size 확인
+            read_size = 0
+            for read in read_deps.__getstate__():
+                #read buffer의 각 dimension size 곱
+                read_size = math.prod(read.ranges.values())
+                #pointwise 연산인 경우 size가 같다.
+                #이런 경우에는 output_tile과 tile이 같다.
+                input_tile[read.name] = []
+                if read_size == write_size :
+                    input_tile[read.name] = output_tile
+
+                #broadcast 연산인 경우 size가 다르다.
+                #layout을 순회하면서 size의 값을 broadcast축이 아닌 것으로 나눈 값이랑 같은 것을 1로 바꾼다.
+                #즉, layout의 dimension을 하나하나 순회하면서 나눈 값과 같은 것만 1로 바꾼다.
+                #broadcast 축은 candidate의 i와 비교하면 안되고 원래 output shape과 비교해야 한다.(find broadcast axis)
+                #broadcast 혹은 ModularIndexing일 수 있다.
+                #ModularIndexing은 하나의 차원을 반복적으로 접근할 때 사용하는 것으로 보인다.
+                else :
+                    # TO DO: 좀더 general하게 짜야한다. 아닌 경우도 나올 수 있다.
+                    # broadcast buffer 연산은 모두 index가 1이다.(다른 케이스가 발생하면 좀 더 명확하게 구분할 수 있어야 할 것 같다.)
+                    # 분명한 구분점이 있어서 구분하는 것보다는 test case pattern에 일치하게 코드를 짜고 있어서 많은 수정이 필요할 수 있다.
+                    if len(read.index)>1:
+                        for i in range(len(read.index)):
+                            axis, divisor, size  = self.find_modular_indexing_axis(read.index._arg[i], inner_fn)
+
+                        if 
+                    
+
+                        for i in range(len(read.index)):
+                            arg_str = str(read.index._args[i]) 
+                            if "ModularIndexing" in arg_str or "//" in arg_str:
+                                axis = self.find_modular_indexing_axis(read.index._arg[i], inner_fn)
+                                
+                            else:
+                                continue
+                    
                         
-                    #broadcast 연산인 경우 size가 다르다.
-                    #layout을 순회하면서 size의 값을 broadcast축이 아닌 것으로 나눈 값이랑 같은 것을 1로 바꾼다.
-                    #즉, layout의 dimension을 하나하나 순회하면서 나눈 값과 같은 것만 1로 바꾼다.
-                    else :
+                    else :    
                         broadcast_tile = []
-                        for i in output_tile_config:
-                            if i == write_size/read_size:
+                        for i in output_tile:
+                            axis = self.find_broadcast_axis(output_layout, write_size/read_size)
+                            if i == axis:
                                 broadcast_tile.append(1)
                             else:
                                 broadcast_tile.append(i)
@@ -2021,50 +2055,220 @@ class Scheduler:
         else:
             #위와 비슷하게 size가 같으면 그냥 pointwise로 생각하고
             #size가 다르면 reduction으로 분류한다.
-            for output_tile_config in output_tile:
-                for read in read_deps.__getstate__():
-                    #read buffer의 각 dimension size 곱
-                    read_size = math.prod(read.ranges.values())
-                    #pointwise 연산인 경우 size가 같다.
-                    #이런 경우에는 output_tile과 tile이 같다.
-                    if read_size == write_size :
-                        input_tile[read.name] = output_tile_config
+            # for output_tile_config in output_tile:
+            for read in read_deps.__getstate__():
+                #read buffer의 각 dimension size 곱
+                read_size = math.prod(read.ranges.values())
+                #pointwise 연산인 경우 size가 같다.
+                #이런 경우에는 output_tile과 tile이 같다.
+                input_tile[read.name] = []
+                if read_size == write_size :
+                    input_tile[read.name] = output_tile
 
-                    else :
-                        reduction_tile = []
-                        # 어떤 축이 reduction 축인지 확인할 수 있는 방법?? 일단은 pattern은 output shape에서 1을 가지는 index 중에 가장 큰 index가 reduction 축이 된다.
-                        for i in reversed(output_tile_config):
-                            mark = False
-                            if i == 1 and not mark:
-                                reduction_tile.append(reduction)
-                                mark = True
-                            else:
-                                #reduction 축 외에는 output tile shape과 그대로 가져간다.
-                                reduction_tile.append(i)
-                        
-                        input_tile[read.name] = reduction_tile
+                else :
+                    reduction_tile = []
+                    # 어떤 축이 reduction 축인지 확인할 수 있는 방법?? 일단은 output shape에서 1을 가지는 index 중에 가장 큰 index가 reduction 축이 된다고 가정하고 해보자.
+                    # To do
+                    # 실제 reduction 축에 대해서 찾아야 함(mark가 reduction_axis를 알려주는 flag로 바뀌어야 함)
+                    # 각 output tile 축을 순회하면서 reduction 축에는 reduction range를 넣는 logic
+                    # find reduction axis to put reduction range
+                    reduction_axis = self.find_reduction_axis(output_layout)
+                    for i in range(len(output_tile)):
+                        if i == reduction_axis:
+                            reduction_tile.append(reduction)
+                        else:
+                            #reduction 축 외에는 output tile shape과 그대로 가져간다.
+                            reduction_tile.append(output_tile[i])
+                    
+                    input_tile[read.name] = reduction_tile
         return input_tile
     
     
     # output_axes : node.node.layout의 size를 통해 얻을 수 있음
     # read_deps_map : node.read_writes.reads를 통해 얻을 수 있음
     # reduction_axes : node.node.data의 reduction_ranges를 통해 알 수 있음
-    def build_op_entry(self, output_layout, read_deps, write_deps, reduction_ranges, is_reduction):
+    def build_op_entry(self, node_name, output_layout, read_deps, write_deps, reduction_ranges, is_reduction, inner_fn):
         op_entries = []
         # generate output tile configs
-        out_tiles = self.gen_output_tile_config(output_layout.size)
+        out_tiles = self.gen_output_tile_config(output_layout.size, write_deps)
         # 각 output tiles에 대해서 input tile configuration을 고르게 된다.
-        # reduction은 reduction축에 대해서만 모두 참조하고 나머지는 output tile에 맞춰서 tile이 정해진다.
-        # broadcast는 broadcast축에 대해서만 참조가 바뀌고 나머지는 1로 고정된다.
-        for t_out in out_tiles:
+        for tile_entry in out_tiles:
+            t_out = tile_entry['candidates']
+            #output tile의 모든 candidate을 순회한다.
+            #리스트로 넘겨서 위의 로직에 문제가 없게 하기 위함
+            if not isinstance(t_out, list):
+                t_out = list(t_out)
             inputs = {}
             # generate input tile configs from read dependencies
             #inputs는 dictionary형태로 buffer이름과 input tile을 저장하는게 목표
-            inputs = self.propagate_input_tile(t_out, read_deps, write_deps, reduction_ranges, is_reduction)
-            op_entries.append({'output_tile': t_out, 'input_tile':inputs})
+            inputs = self.propagate_input_tile(t_out, read_deps, write_deps, reduction_ranges, is_reduction, output_layout.size, inner_fn)
+            op_entries.append({'node_name': node_name, 'output_tile': tile_entry, 'input_tile':inputs})
+            
+        # self.pretty_print_tile_map(op_entries)
         return op_entries
                 
+
+    def pretty_print_tile_map(self, op_entries):
+        for idx, entry in enumerate(op_entries):
+            print(f"\n=== Output Tile #{idx+1}: {entry['output_tile']} ===")
+            for buf_name, tile in entry['input_tile'].items():
+                print(f"  {buf_name:20} -> {tile}")
+                
+                
+    def find_modular_indexing_axis(self, read_deps, inner_fn):
+        #inner_fn을 parsing해서 실제 ModularIndexing이 있는지 확인한다.
+        code_str = str(inner_fn)
+        lines = code_str.split("\\n")
+        lines_with_modular = [line for line in lines if "ModularIndexing" in line]
+        
+        #4차원까지만 있다고 가정
+        axis_map = {
+            "i0": 1,
+            "i1": 2,
+            "i2": 3,
+            "i3": 4
+        }
+        for line in lines_with_modular:
+            match = re.search(r"ModularIndexing\((.*?)\)", line)
+            if match:
+                args_str = match.group(1)  # 예: "i1, 4, 4"
+                args = [arg.strip() for arg in args_str.split(",")]
+                var_name = args[0]  # 첫 번째 인자가 변수 이름
+                axis = axis_map.get(var_name, None)
+                other_args = args[1:]              # 나머지 값들
+                return (axis, *other_args)         # axis + 나머지 값 tuple로 반환
+            return None
+
+    
+    
+    
+    def find_reduction_axis(self, output_layout):
+        index = len(output_layout)
+        #output_layout의 각 차원을 거꾸로 순회하면서 1을 만나면 해당 축을 reduction축으로 가정한다.(아직은 어떻게 reduction축을 잡아야할지 모르겠다. 일단 llama 패턴에서는 해당 관점이 가능하다. 다른 모델도 해보자.)
+        for i in reversed(output_layout):
+            if i == 1:         
+                axis = index
+                return axis
+            index -=1
+        # output_layout에 scalar 결과가 저장되는 경우
+        return 0
+    
+    
+    def find_broadcast_axis(self, output_layout, broadcast_size):
+        index = 0
+        for i in output_layout:
+            if broadcast_size == i:
+                return index
+            index += 1
+########################################################################################################
+########################################################################################################
+# implement fusion grouping
+ 
+    def flatten_tile_map(self, tile_map):
+        #가장 바깥쪽의 list을 flattening
+        flat =[]
+        for item in tile_map:
+            if isinstance(item, list):
+                flat.extend(item)
+            else:
+                flat.append(item)
+        return flat
+    
+    def group_by_node(self, tile_map):
+        #node_name을 기준으로 input tile, output tile grouping
+        flat = self.flatten_tile_map(tile_map)
+        groups = defaultdict(list)
+        for entry in flat:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get('node_name')
+            if name is None:
+                continue
+            groups[name].append(entry)
+        print(dict(groups))
+        return dict(groups)
+    
+    def shapes_equal(self, output_tile_shape, input_tile_shape):
+        #순서 달라도 shape 비교할 수 있도록 하고 싶음
+        if output_tile_shape == input_tile_shape:
+            return True
+        else:
+            if len(output_tile_shape) > len(input_tile_shape):
+                # 첫번째 차원이 1이라면 불필요한 차원이기 때문에 지우고 비교하는것 가능
+                # sort는 reordering의 효과를 비슷하게 내기 위해서(각각의 요소를 일일이 검사하지 않고 sort해서 비교하기 위해서)
+                # sort했을 때 같으면 요소별로 모두 동일하다는 의미이기 때문에 fusion 가능하다고 할 수 있다.
+                output_filtered = [x for i,x in enumerate(output_tile_shape) if not (i==0 and x == 1)]
+                return sorted(output_filtered) == sorted(input_tile_shape)
+            else:
+                input_filtered = [x for i,x in enumerate(input_tile_shape) if not (i==0 and x == 1)]
+                return sorted(input_filtered) == sorted(output_tile_shape)
+    
+    def can_fuse(self, op_a, op_b):
+        # 1. write buffer name == read buffer name
+        # 2. write buffer shape == read buffer shape
+        # if 2 conditions are both true, it can be fused.
+        out_buf_a = op_a['output_tile']['output_tile']
+        out_shape_a = op_a['output_tile']['candidates']
+        in_buf_a = op_a['input_tile'].items()
+        
+        # veritcal fusion
+        for in_buf, in_shape in op_b['input_tile'].items():
+            if in_buf == out_buf_a and self.shapes_equal(out_shape_a, in_shape):
+                return True
+        
+        # horizontal fusion
+        # group을 묶기 위해 op1 read buffer name == op2 read buffer name
+        # read buffer shape이 같은 경우도 fusion group으로 묶는다.
+        for in_buf1, in_shape1 in op_a['input_tile'].items():
+            for in_buf2, in_shape2 in op_b['input_tile'].items():
+                if in_buf1 == in_buf2 and self.shapes_equal(in_shape1, in_shape2):
+                    return True
+        
+        return False
+    
+    
+    #BFS 방식으로 current op에서 fusion 가능한 op를 모두 찾고 그 다음 fusion group에 있는 node의 op를 수행하면서 fusion 가능한 node를 찾게된다.
+    def compute_fusion_group(self, tile_map):
+        """
+        Args:
+            tile_map (List[Dict[str, List]]): input, output tile(block) shape mapping 
+
+
+        Returns:
+            fusion_groups (List[List]) : returns list of fusion groups like [[op1, op2, op3],[op454, op490, op555], ...]
+        # """
+        # op 개수
+        num_ops = len(tile_map)
+        
+        visited = set()
+        fusion_groups = []
+        op_names = tile_map.keys()
+        
+        for op_name in op_names:
+            if op_name in visited:
+                continue 
             
+            group = [op_name]
+            queue = [op_name]
+            visited.add(op_name)
+            
+            
+            while queue:
+                current_op = queue.pop(0)
+                
+                start_index = op_names(current_op)
+                # last_op_name = group[-1]
+                
+                # for next_op_name in tile_map.keys():
+                #     if next_op_name in visited:
+                #         continue
+                    
+                #     for out_tile_entry in tile_map[last_op_name]:
+                #         for in_tile_entry in tile_map[next_op_name]:
+                #             if self.can_fuse(out_tile_entry, in_tile_entry):
+                                
+    
+    
     #############################################################################
     
     
