@@ -1835,6 +1835,7 @@ class Scheduler:
         }
         self.name_to_fused_node: Dict[str, BaseSchedulerNode] = self.name_to_node.copy()
 
+        self.name_to_fused_node2: Dict[str, BaseSchedulerNode] = self.name_to_node.copy()
         # mutation_real_name: Maps back to the original name for codegen
         # Example:
         # If you mutate buf0 inside of buf1's kernel, then:
@@ -1851,11 +1852,7 @@ class Scheduler:
         # mutation_renames = {"buf1" : "buf0"}
         # in codegen we only use buf0, never buf1
         self.mutation_renames: Dict[str, str] = {}
-        ########################################################################
-        self.get_buffer_info()
-        # tile_map = self.get_input_output_tile()
-        # self.group_by_node(tile_map)
-        ########################################################################
+        
         self.compute_dependencies()
         self.nodes = self.topological_sort_schedule(self.nodes)
         self.dead_node_elimination()
@@ -1875,7 +1872,40 @@ class Scheduler:
         self.logged_slow_fusion: OrderedSet[Tuple[str, str]] = OrderedSet()
         if config._pre_fusion_custom_pass is not None:
             self.nodes = config._pre_fusion_custom_pass(self.nodes)
+        ########################################################################
+        # self.get_buffer_info()
+        fusedNodes, tile_map = self.get_input_output_tile()
+        sum1=0
+        sum2=0
+        for i in self.nodes:
+            if isinstance(i.node, ir.MultiTemplateBuffer):
+                sum1+=1
+            elif isinstance(i.node, ir.ExternKernel):
+                sum2+=1
+        print(len(self.nodes))
+        print(sum1, sum2)
+        print(len(tile_map))
+        ######################################################################## 
         self.nodes = self.fuse_nodes(self.nodes)
+        # self.nodes = fusedNodes
+        #####################################################################
+        fused_list0 = []
+        fused_list1 = []
+        sum0 = 0 
+        sum1 = 0
+        for i in self.nodes:
+            if isinstance(i, FusedSchedulerNode):
+                fused_list0.append(i.get_nodes())
+                sum0+=1
+            elif isinstance(i, SchedulerNode):
+                if not isinstance(i.node, ir.MultiTemplateBuffer):
+                    fused_list1.append(i.get_name())
+                    sum1+=1
+        print(len(self.nodes), sum0, sum1)
+        print(fused_list0, end='\n')
+        print(fused_list1)
+        
+        #####################################################################
         if config.reorder_for_peak_memory:
             from .memory import reorder_for_peak_memory
 
@@ -1897,12 +1927,11 @@ class Scheduler:
         V.debug.ir_post_fusion(self.nodes)
         V.debug.graph_diagram(self.nodes)
         self.debug_draw_graph()
-        ########################################################################
-        # self.get_buffer_info()
-        ########################################################################
         # used during codegen:
         self.buffer_names_to_free: OrderedSet[str] = OrderedSet()
 
+        
+        
         # fx graph node to the position it appears in the graph
         # for debug attribution
         self.origin_to_index: Dict[torch.fx.Node, int] = {}
@@ -1929,30 +1958,27 @@ class Scheduler:
             else:
                 print(node.get_name(), end='\n')
                 print(node)
-                # print(node.node)
-                # print("reads : ", node.read_writes.reads)
-                # print("writes : ", node.read_writes.writes)
-                # print("\n")
         print("==================================================================================")
-        
-        
+#####################################################################################################    
     #use tile_map to mapping output tile and input tile    
     def get_input_output_tile(self):
         tile_map = []
         for node in self.nodes:
             #일단 mm연산에 대해서는 skip(MultiTemplateBuffer)
             if isinstance(node, (SchedulerNode, FusedSchedulerNode)) and not isinstance(node.node, ir.MultiTemplateBuffer):
-                
                 is_reduction = node.is_reduction()
                 if is_reduction:
-                    tile_map.append(self.build_op_entry(node.get_name(), node.node.layout, node.read_writes.reads, node.read_writes.writes, node.node.data.reduction_ranges[0], is_reduction, node.node.data.__inner_fn_str_cache))
+                    tile_map.append(self.build_op_entry(node.get_name(), node.node.layout, node.read_writes.reads, node.read_writes.writes, node.node.data.reduction_ranges[0], is_reduction, None, node))
                     
                 else:
-                    tile_map.append(self.build_op_entry(node.get_name(), node.node.layout, node.read_writes.reads, node.read_writes.writes, None, is_reduction))
+                    tile_map.append(self.build_op_entry(node.get_name(), node.node.layout, node.read_writes.reads, node.read_writes.writes, None, is_reduction, str(node.node.data), node))
                     
-        # print(tile_map)
-        # print("end of input_output_tile map=================================================================================")
-        return tile_map
+        flatten_tile = self.group_by_node(tile_map)
+        fusedNodes, fusion_group = self.group_op(flatten_tile)
+        print("length of fusion_group",len(fusion_group))
+        print(fusion_group)
+        print(fusedNodes)
+        return fusedNodes, flatten_tile
     
     #to generate all candidate sizes of each axis
     def candidate_sizes_for_axis(self, n):
@@ -1989,7 +2015,7 @@ class Scheduler:
         return tiles
     
     #여기에서 말하는 output_tile은 여러 tile configuration 중에서 하나인 것임
-    def propagate_input_tile(self, output_tile, read_deps, write_deps, reduction, is_reduction, output_layout, inner_fn):
+    def propagate_input_tile(self, output_tile, read_deps, write_deps, reduction, is_reduction, output_layout, results):
         
         input_tile = {}
         # output_tile = list(output_tile)
@@ -2006,50 +2032,61 @@ class Scheduler:
             # node.read_writes.reads.__getstate__()[]로 index, range, sizes 모두 접근 가능
             # dependencies하나씩 순회하면서 size 확인
             read_size = 0
+            # results = self.extract_info_from_inner_fn(inner_fn)
+            if results is not None:
+                modular_result = results[0]
+
             for read in read_deps.__getstate__():
                 #read buffer의 각 dimension size 곱
                 read_size = math.prod(read.ranges.values())
-                #pointwise 연산인 경우 size가 같다.
-                #이런 경우에는 output_tile과 tile이 같다.
                 input_tile[read.name] = []
-                if read_size == write_size :
-                    input_tile[read.name] = output_tile
+                modular_tile = []
+                #modularIndexing있는지 확인(None 혹은 list)
+                
+                
+                #만약 read write buffer size가 같을 때 내부적으로 ModularIndexing이 있는지까지 확인해서 없으면 pointwise, 있으면 ModularIndexing에 대한 propagate 수행
+                # Modular Indexing은 buffer size는 계속 같은 size로 나온다
+                if read_size == write_size:
+                    if results is not None and read.name == modular_result["buf"]:
+                        source = modular_result["source"]
+                        axis = modular_result["modular_axis"]
+                        group = modular_result["all_axes"]
+                        param = modular_result["modular_params"]
+                        for i in range(len(output_tile)):
+                            #modular index로 채워야 함
+                            if i == axis:
+                                if source == "ModularIndexing":
+                                #ModularIndexintg(i, x, y) = (i/x) % y
+                                # 이렇게 해서 몇개의 요소를 참조해야하는지 고정한다.(몇개의 요소를 반복적으로 참조할지)
+                                # 결국 y가 결정하는게 몇개의 요소를 반복해서 참조할지를 정하는 것으로 보인다.
+                                    modular_tile.append((output_tile[i]/param[0])%param[1] + 1)
+                                else:
+                                    modular_tile.append((output_tile[i]//param + 1))
+                            elif i in group:
+                                modular_tile.append(output_tile[i])
+                            # 만약 axis에 없으면 다 1로 채워야 함. 왜냐하면 해당 축은 원래 indexing하지 않는데 loop size를 맞추기 위해 늘려놓은 축이기 때문에 실제 shape에서는 사용되지 X
+                            else:
+                                modular_tile.append(1)
+                        
+                        input_tile[read.name] = modular_tile
+                    #modularIndexing의 buffer 이름과 같은게 없으면 pointwise 연산
+                    else:
+                        input_tile[read.name] = output_tile
 
                 #broadcast 연산인 경우 size가 다르다.
                 #layout을 순회하면서 size의 값을 broadcast축이 아닌 것으로 나눈 값이랑 같은 것을 1로 바꾼다.
                 #즉, layout의 dimension을 하나하나 순회하면서 나눈 값과 같은 것만 1로 바꾼다.
                 #broadcast 축은 candidate의 i와 비교하면 안되고 원래 output shape과 비교해야 한다.(find broadcast axis)
                 #broadcast 혹은 ModularIndexing일 수 있다.
-                #ModularIndexing은 하나의 차원을 반복적으로 접근할 때 사용하는 것으로 보인다.
-                else :
-                    # TO DO: 좀더 general하게 짜야한다. 아닌 경우도 나올 수 있다.
-                    # broadcast buffer 연산은 모두 index가 1이다.(다른 케이스가 발생하면 좀 더 명확하게 구분할 수 있어야 할 것 같다.)
-                    # 분명한 구분점이 있어서 구분하는 것보다는 test case pattern에 일치하게 코드를 짜고 있어서 많은 수정이 필요할 수 있다.
-                    if len(read.index)>1:
-                        for i in range(len(read.index)):
-                            axis, divisor, size  = self.find_modular_indexing_axis(read.index._arg[i], inner_fn)
-
-                        if 
-                    
-
-                        for i in range(len(read.index)):
-                            arg_str = str(read.index._args[i]) 
-                            if "ModularIndexing" in arg_str or "//" in arg_str:
-                                axis = self.find_modular_indexing_axis(read.index._arg[i], inner_fn)
-                                
-                            else:
-                                continue
-                    
-                        
-                    else :    
-                        broadcast_tile = []
-                        for i in output_tile:
-                            axis = self.find_broadcast_axis(output_layout, write_size/read_size)
-                            if i == axis:
-                                broadcast_tile.append(1)
-                            else:
-                                broadcast_tile.append(i)
-                        input_tile[read.name] = broadcast_tile
+                else :                
+                    broadcast_tile = []
+                    for i in output_tile:
+                        axis = self.find_broadcast_axis(output_layout, write_size/read_size)
+                        if i == axis:
+                            broadcast_tile.append(1)
+                        else:
+                            broadcast_tile.append(i)
+                    input_tile[read.name] = broadcast_tile
                 
         #reduction 처리
         else:
@@ -2087,10 +2124,17 @@ class Scheduler:
     # output_axes : node.node.layout의 size를 통해 얻을 수 있음
     # read_deps_map : node.read_writes.reads를 통해 얻을 수 있음
     # reduction_axes : node.node.data의 reduction_ranges를 통해 알 수 있음
-    def build_op_entry(self, node_name, output_layout, read_deps, write_deps, reduction_ranges, is_reduction, inner_fn):
+    def build_op_entry(self, node_name, output_layout, read_deps, write_deps, reduction_ranges, is_reduction, inner_fn, node):
         op_entries = []
         # generate output tile configs
         out_tiles = self.gen_output_tile_config(output_layout.size, write_deps)
+        # ModularIndexing이 있는지 inner_fn을 통해서 확인한다.(parsing)
+        # reduction에는 ModularIndexing이 없으니 pointwise 연산에만 results를 반환하게 한다.
+        if not is_reduction:
+            results = self.extract_info_from_inner_fn(str(read_deps))
+        else:
+            results = None
+        
         # 각 output tiles에 대해서 input tile configuration을 고르게 된다.
         for tile_entry in out_tiles:
             t_out = tile_entry['candidates']
@@ -2101,8 +2145,8 @@ class Scheduler:
             inputs = {}
             # generate input tile configs from read dependencies
             #inputs는 dictionary형태로 buffer이름과 input tile을 저장하는게 목표
-            inputs = self.propagate_input_tile(t_out, read_deps, write_deps, reduction_ranges, is_reduction, output_layout.size, inner_fn)
-            op_entries.append({'node_name': node_name, 'output_tile': tile_entry, 'input_tile':inputs})
+            inputs = self.propagate_input_tile(t_out, read_deps, write_deps, reduction_ranges, is_reduction, output_layout.size, results)
+            op_entries.append({'node_name': node_name, 'output_tile': tile_entry, 'input_tile':inputs ,'node': node})
             
         # self.pretty_print_tile_map(op_entries)
         return op_entries
@@ -2114,33 +2158,62 @@ class Scheduler:
             for buf_name, tile in entry['input_tile'].items():
                 print(f"  {buf_name:20} -> {tile}")
                 
-                
-    def find_modular_indexing_axis(self, read_deps, inner_fn):
-        #inner_fn을 parsing해서 실제 ModularIndexing이 있는지 확인한다.
-        code_str = str(inner_fn)
-        lines = code_str.split("\\n")
-        lines_with_modular = [line for line in lines if "ModularIndexing" in line]
-        
-        #4차원까지만 있다고 가정
-        axis_map = {
-            "i0": 1,
-            "i1": 2,
-            "i2": 3,
-            "i3": 4
-        }
-        for line in lines_with_modular:
-            match = re.search(r"ModularIndexing\((.*?)\)", line)
-            if match:
-                args_str = match.group(1)  # 예: "i1, 4, 4"
-                args = [arg.strip() for arg in args_str.split(",")]
-                var_name = args[0]  # 첫 번째 인자가 변수 이름
-                axis = axis_map.get(var_name, None)
-                other_args = args[1:]              # 나머지 값들
-                return (axis, *other_args)         # axis + 나머지 값 tuple로 반환
-            return None
 
-    
-    
+    def extract_info_from_inner_fn(self, read_dep_str):
+        results = []
+        
+    # 1. reads 버퍼 문자열을 MemoryDep 항목별로 분리
+        deps = re.findall(r'MemoryDep\((.*?)\)', read_dep_str)
+        
+        modular_found_anywhere = False
+        for dep in deps:
+            buf_name = dep[0]
+            dep_content = dep[1]
+            # 2. ModularIndexing 패턴 검색
+            mod_match = re.search(r'ModularIndexing\(c(\d+),\s*(\d+),\s*(\d+)\)', dep_content)
+            
+            # 3. 정수 나눗셈 (//) 패턴 검색
+            div_match = re.search(r'c(\d+)\s*//\s*(\d+)', dep_content)
+            
+            if mod_match:
+                # ModularIndexing 정보 추출(각 축은 항상 1을 더해줘야 dimension이 맞다.)
+                modular_found_anywhere = True
+                mod_axis = int(mod_match.group(1))+1
+                mod_params = (int(mod_match.group(2)), int(mod_match.group(3)))
+                
+                # 모든 관련 축 찾기
+                all_axes = sorted([int(m+1) for m in re.findall(r'c(\d+)', dep_content)])
+                
+                results.append({
+                    "buf" : buf_name,
+                    "source": "ModularIndexing",
+                    "all_axes": all_axes,
+                    "modular_axis": mod_axis,
+                    "param": mod_params
+                })
+                
+            elif div_match:
+                # 정수 나눗셈 정보 추출
+                modular_found_anywhere = True
+                div_axis = int(div_match.group(1))+1
+                divisor = int(div_match.group(2))
+                
+                # 모든 관련 축 찾기
+                all_axes = sorted([int(m+1) for m in re.findall(r'c(\d+)', dep_content)])
+                
+                results.append({
+                    "buf" : buf_name,
+                    "source": "Integer Division",
+                    "all_axes": all_axes,
+                    "modular_axis": div_axis,
+                    "param": divisor
+                })
+                
+        if not modular_found_anywhere:
+            return None
+                    
+        return results
+        
     
     def find_reduction_axis(self, output_layout):
         index = len(output_layout)
@@ -2185,7 +2258,6 @@ class Scheduler:
             if name is None:
                 continue
             groups[name].append(entry)
-        print(dict(groups))
         return dict(groups)
     
     def shapes_equal(self, output_tile_shape, input_tile_shape):
@@ -2203,13 +2275,12 @@ class Scheduler:
                 input_filtered = [x for i,x in enumerate(input_tile_shape) if not (i==0 and x == 1)]
                 return sorted(input_filtered) == sorted(output_tile_shape)
     
-    def can_fuse(self, op_a, op_b):
+    def can_fusion(self, op_a, op_b):
         # 1. write buffer name == read buffer name
         # 2. write buffer shape == read buffer shape
         # if 2 conditions are both true, it can be fused.
         out_buf_a = op_a['output_tile']['output_tile']
         out_shape_a = op_a['output_tile']['candidates']
-        in_buf_a = op_a['input_tile'].items()
         
         # veritcal fusion
         for in_buf, in_shape in op_b['input_tile'].items():
@@ -2226,52 +2297,101 @@ class Scheduler:
         
         return False
     
-    
-    #BFS 방식으로 current op에서 fusion 가능한 op를 모두 찾고 그 다음 fusion group에 있는 node의 op를 수행하면서 fusion 가능한 node를 찾게된다.
-    def compute_fusion_group(self, tile_map):
-        """
-        Args:
-            tile_map (List[Dict[str, List]]): input, output tile(block) shape mapping 
-
-
-        Returns:
-            fusion_groups (List[List]) : returns list of fusion groups like [[op1, op2, op3],[op454, op490, op555], ...]
-        # """
-        # op 개수
-        num_ops = len(tile_map)
         
+    #PyTorch가 fusion group을 만드는 것과 거의 동일하게 동작하게 해보기                                    
+    def group_op(self, tile_map):
+        fused_nodes = OrderedSet(self.nodes)
         visited = set()
         fusion_groups = []
-        op_names = tile_map.keys()
         
-        for op_name in op_names:
-            if op_name in visited:
-                continue 
-            
-            group = [op_name]
-            queue = [op_name]
-            visited.add(op_name)
-            
-            
-            while queue:
-                current_op = queue.pop(0)
+        nodes = list(tile_map.keys())
+    
+        for node_name in nodes:
+            if node_name not in visited:
+                group = []
+                queue = collections.deque([node_name])
+                visited.add(node_name)
+                # if len(group) < 10:
+                group.append(node_name)
+                # else:
+                #     continue # 그룹 크기가 이미 10이면 다음 노드로 넘어감
                 
-                start_index = op_names(current_op)
-                # last_op_name = group[-1]
-                
-                # for next_op_name in tile_map.keys():
-                #     if next_op_name in visited:
-                #         continue
+                while queue:
+                    current_node = queue.popleft()
+                    current_ops = tile_map[current_node]
                     
-                #     for out_tile_entry in tile_map[last_op_name]:
-                #         for in_tile_entry in tile_map[next_op_name]:
-                #             if self.can_fuse(out_tile_entry, in_tile_entry):
+                    # 현재 노드와 모든 미방문 노드 간의 퓨전 가능성 확인
+                    for next_node in nodes:
+                        if next_node not in visited:
+                            next_ops = tile_map[next_node]
+                            
+                            can_fuse = False
+                            first_scheduler_node = tile_map[current_node][0]['node']
+                            second_scheduler_node = tile_map[next_node][0]['node']
+                            # 다음 fusion에 지장을 주지 않기 위해 새로운 name_to_fused_node를 복제함
+                            node1 = self.name_to_fused_node2[first_scheduler_node.get_first_name()]
+                            node2 = self.name_to_fused_node2[second_scheduler_node.get_first_name()]
+                            
+                            # 현재 노드(current_node)와 다음 노드(next_node) 간 퓨전 가능한지 확인
+                            for op_a in current_ops:
+                                for op_b in next_ops:
+                                    if self.can_fusion(op_a, op_b):
+                                        can_fuse = True
+                                        break
+                                if can_fuse:
+                                    break
+                            
+                            # 퓨전이 가능한 경우에만 사이클 검사 진행
+                            if can_fuse:
+                                creates_cycle_with_group = False
+                                # 그룹 내 모든 기존 노드와 사이클이 발생하는지 확인
+                                for existing_node in group:
+                                    scheduler_node1 = tile_map[existing_node][0]['node']
+                                    scheduler_node2 = tile_map[next_node][0]['node']
+                                    
+                                    # will_fusion_create_cycle은 퓨전 가능성을 내부적으로 가정하므로,
+                                    # 사이클이 하나라도 발견되면 즉시 루프 중단
+                                    # 그리고 해당 next node는 group에 넣지 않는다.
+                                    if self.will_fusion_create_cycle(scheduler_node1, scheduler_node2):
+                                        creates_cycle_with_group = True
+                                        break
                                 
+                                # 그룹 크기 제한을 초과하지 않고, 사이클이 없다면 노드 추가
+                                if not creates_cycle_with_group:
+                                    # if len(group) + 1 <= 10:
+                                    # PyTorch 처럼 너무 먼 거리의 node간에는 fusion 안하기
+                                    if not self.are_long_distant_nodes(node1, node2):
+                                        visited.add(next_node)
+                                        group.append(next_node)
+                                        queue.append(next_node)
+                                        
+                                        device = node1.get_device()
+                                        node3 = self.get_backend(device).fuse(node1, node2)
+                                        fused_nodes.remove(node1)
+                                        fused_nodes.remove(node2)
+                                        fused_nodes.add(node3)
+                                        #op0와 op1이 만약 op0_1로 fused된 경우에 op0, 1을 op0_1로 판단해서 fusion을 계속하는 방식
+                                        self.name_to_fused_node2.update(
+                                            {n.get_name(): node3 for n in node3.get_nodes()}
+                                        )
+                    
+                if group:
+                    # op 번호 순서대로 정렬
+                    sorted_group = sorted(group, key=lambda x: int(x[2:]))
+                    fusion_groups.append("_".join(sorted_group))
+                    # fusedNodes = sorted(fused_nodes, key=lambda x: x.min_order)
+                    # fusedNodes = self.topological_sort_schedule(fusedNodes)
+                    # self.prune_redundant_deps(fusedNodes)
+        fusedNodes = sorted(fused_nodes, key=lambda x: x.min_order)
+        fusedNodes = self.topological_sort_schedule(fusedNodes)
+        self.prune_redundant_deps(fusedNodes)            
+                    
+        # return fusion_groups
+        return fusedNodes, fusion_groups
     
-    
-    #############################################################################
-    
-    
+#########################################################################################
+#########################################################################################  
+  
     def get_donated_buffers(self) -> Dict[str, SchedulerDonatedBuffer]:
         name_to_donated_buf = {}
         for name in V.graph.graph_inputs_original:
